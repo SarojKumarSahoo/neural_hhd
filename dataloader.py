@@ -1,10 +1,11 @@
+import json
 from pathlib import Path
 from typing import Dict, Union
+
 import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
-import json
 
 
 class VFDataset(Dataset):

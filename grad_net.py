@@ -1,69 +1,113 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 
 class GradSineLayer(nn.Module):
+    """
+    Defines a modified linear layer with sinusoidal activation function.
+    """
+
     def __init__(
-        self, in_features: int, out_features: int, bias: bool = True, is_first: bool = False, omega_0: int = 30
-    ) -> None:
-        super().__init__()
-        self.omega_0 = omega_0
-        self.is_first = is_first
+        self, input_dim: int, output_dim: int, omega: int = 30, include_bias: bool = True, first_layer: bool = False
+    ):
+        """
+        Initialize the layer.
 
-        self.in_features = in_features
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        Parameters:
+        - input_dim: Number of input features.
+        - output_dim: Number of output features.
+        - omega: Scaling factor for sinusoidal activation.
+        - include_bias: Whether to include a bias term.
+        - first_layer: Whether this is the first layer of the network.
+        """
+        super(GradSineLayer, self).__init__()
+        self.input_dim = input_dim
+        self.omega = omega
+        self.first_layer = first_layer
 
-        self.init_weights()
+        # Define the linear layer
+        self.linear = nn.Linear(input_dim, output_dim, bias=include_bias)
 
-    def init_weights(self):
+        # Initialize weights
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """
+        Initialize weights based on whether it's the first layer or not.
+        """
         with torch.no_grad():
-            if self.is_first:
-                self.linear.weight.uniform_(-1 / self.in_features, 1 / self.in_features)
+            if self.first_layer:
+                self.linear.weight.uniform_(-1 / self.input_dim, 1 / self.input_dim)
             else:
-                self.linear.weight.uniform_(
-                    -np.sqrt(6 / self.in_features) / self.omega_0, np.sqrt(6 / self.in_features) / self.omega_0
-                )
+                bound = np.sqrt(6 / self.input_dim) / self.omega
+                self.linear.weight.uniform_(-bound, bound)
 
-    def forward(self, input):
-        prior_act, prior_deriv_act = input[0], input[1]
+    def forward(self, activations: torch.Tensor, prev_derivatives: torch.Tensor):
+        """
+        Forward pass for the layer.
 
-        pre_act = self.omega_0 * self.linear(prior_act)
-        act = torch.sin(pre_act)
+        Parameters:
+        - activations: Activations from the previous layer.
+        - prev_derivatives: Derivatives of activations from the previous layer.
+        """
+        # Compute pre-activations
+        pre_activations = self.omega * self.linear(activations)
 
-        deriv_pre_act = self.omega_0 * F.linear(prior_deriv_act, self.linear.weight, None)
-        deriv_act = torch.cos(pre_act).unsqueeze(-2) * deriv_pre_act
+        # Apply sinusoidal activation
+        new_activations = torch.sin(pre_activations)
 
-        return act, deriv_act
+        # Compute derivatives using the chain rule
+        derivatives = self.omega * F.linear(prev_derivatives, self.linear.weight, None)
+        new_derivatives = torch.cos(pre_activations).unsqueeze(-2) * derivatives
+
+        return new_activations, new_derivatives
 
 
 class GradSiren(nn.Module):
-    def __init__(
-        self, in_features: int = 2, out_features: int = 2, hidden_features: int = 256, n_layers: int = 6, w0: int = 30
-    ) -> None:
+    """
+    Neural network model using GradSineLayer modules.
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int = 256, num_layers: int = 6, omega: int = 30):
+        """
+        Initialize the network.
+
+        Parameters:
+        - input_dim: Number of input features.
+        - output_dim: Number of output features.
+        - hidden_dim: Number of features in hidden layers.
+        - num_layers: Total number of layers.
+        - omega: Scaling factor for sinusoidal activation.
+        """
         super(GradSiren, self).__init__()
 
-        self.net_layers = nn.ModuleList()
-        for idx in range(n_layers):
-            if idx == 0:
-                self.net_layers.append(GradSineLayer(in_features, hidden_features, bias=True, is_first=idx == 0))
-            elif idx > 0 and idx != n_layers - 1:
-                self.net_layers.append(GradSineLayer(hidden_features, hidden_features, bias=True, is_first=idx == 0))
-            else:
-                final_linear = nn.Linear(hidden_features, out_features)
-                with torch.no_grad():
-                    final_linear.weight.uniform_(-np.sqrt(6 / hidden_features), np.sqrt(6 / hidden_features))
-                self.net_layers.append(final_linear)
+        layers = []
+        for idx in range(num_layers - 1):
+            in_dim = input_dim if idx == 0 else hidden_dim
+            out_dim = hidden_dim
+            layers.append(GradSineLayer(in_dim, out_dim, omega, first_layer=(idx == 0)))
 
-    def forward(self, input):
-        out = input
-        deriv_shape = list(input.shape) + [2]
-        deriv_out = torch.zeros(deriv_shape, dtype=input.dtype, device=input.device)
-        deriv_out[:, torch.arange(2), torch.arange(2)] = 1
-        for ndx, net_layer in enumerate(self.net_layers):
-            if ndx < len(self.net_layers) - 1:
-                out, deriv_out = net_layer([out, deriv_out])
+        # Add the final linear layer
+        layers.append(nn.Linear(hidden_dim, output_dim))
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, inputs: torch.Tensor):
+        """
+        Forward pass for the network.
+        """
+        activations = inputs
+        # Initialize derivatives with identity matrix for input dimensions
+        derivatives_shape = list(inputs.shape) + [inputs.shape[-1]]
+        derivatives = torch.zeros(derivatives_shape, dtype=inputs.dtype, device=inputs.device)
+        derivatives[..., torch.arange(inputs.shape[-1]), torch.arange(inputs.shape[-1])] = 1
+
+        for layer in self.network:
+            if isinstance(layer, GradSineLayer):
+                activations, derivatives = layer(activations, derivatives)
             else:
-                deriv_out = F.linear(deriv_out, net_layer.weight, None)
-        return deriv_out.squeeze(-1)
+                derivatives = F.linear(derivatives, layer.weight, None)
+
+        return derivatives.squeeze(-1)
